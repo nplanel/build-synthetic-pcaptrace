@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	logger "log"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,6 +18,22 @@ import (
 )
 
 var log = logger.New(os.Stdout, "", 0)
+
+type Packet struct {
+	data []byte
+}
+
+type Flow struct {
+	ID       int64
+	pcapInfo *PCAPInfo
+}
+
+func (b *SyntheticPcapTraceBuilder) newFlow(pinfo *PCAPInfo) *Flow {
+	return &Flow{
+		ID:       b.rand.Int63(),
+		pcapInfo: pinfo,
+	}
+}
 
 type PCAPFile struct {
 	file   *os.File
@@ -160,24 +179,13 @@ func (b *SyntheticPcapTraceBuilder) updateMaxValues() {
 	b.maxFlows = b.GoalFlowSteadyStatePerSecond
 }
 
-type Flow struct {
-	ID       int64
-	pcapInfo *PCAPInfo
-}
-
-func (b *SyntheticPcapTraceBuilder) newFlow(pinfo *PCAPInfo) *Flow {
-	return &Flow{
-		ID:       b.rand.Int63(),
-		pcapInfo: pinfo,
-	}
-}
-func (b *SyntheticPcapTraceBuilder) flushPackets(packets []gopacket.Packet) {
+func (b *SyntheticPcapTraceBuilder) flushPackets(packets []*Packet) {
 	flushAt := b.currentPacketTime
 
 	usec := 1000000.0 / len(packets)
 	log.Printf("flush %d packets, usec per packet %d flush at %v", len(packets), usec, flushAt)
 	for _, packet := range packets {
-		data := packet.Data()
+		data := packet.data
 		ci := gopacket.CaptureInfo{
 			CaptureLength: len(data),
 			Length:        len(data),
@@ -198,15 +206,53 @@ func (b *SyntheticPcapTraceBuilder) flushPackets(packets []gopacket.Packet) {
 	b.lastSecondFlows = 0
 
 }
-func (b *SyntheticPcapTraceBuilder) modifyIPLayer(packet *gopacket.Packet) gopacket.Packet {
-	return *packet
+
+func modifyIPv4(orig net.IP, f *Flow) net.IP {
+	v := binary.BigEndian.Uint32(orig) ^ uint32(f.ID)
+	ret := net.IP{0, 0, 0, 0}
+	binary.BigEndian.PutUint32(ret, v)
+	return ret
 }
+
+func (b *SyntheticPcapTraceBuilder) modifyIPLayer(packet *gopacket.Packet, f *Flow) *Packet {
+	var newLayers []gopacket.SerializableLayer
+	var ipv4 *layers.IPv4
+	for _, l := range (*packet).Layers() {
+		switch l.LayerType() {
+		case layers.LayerTypeIPv4:
+			ipv4, _ = l.(*layers.IPv4)
+			ipv4.SrcIP = modifyIPv4(ipv4.SrcIP, f)
+			ipv4.DstIP = modifyIPv4(ipv4.DstIP, f)
+			newLayers = append(newLayers, ipv4)
+			continue
+		case layers.LayerTypeUDP:
+			udp, _ := l.(*layers.UDP)
+			udp.SetNetworkLayerForChecksum(ipv4)
+		case layers.LayerTypeTCP:
+			tcp, _ := l.(*layers.TCP)
+			tcp.SetNetworkLayerForChecksum(ipv4)
+		}
+		newLayers = append(newLayers, l.(gopacket.SerializableLayer))
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+	if err := gopacket.SerializeLayers(buffer, options, newLayers...); err != nil {
+		log.Fatalf("serialize new ipv4 error : %s", err.Error())
+	}
+	return &Packet{
+		data: buffer.Bytes(),
+	}
+}
+
 func (b *SyntheticPcapTraceBuilder) processPackets(f *Flow) {
 	log.Printf("process %d packets", len(f.pcapInfo.Gopackets))
-	packets := []gopacket.Packet{}
+	packets := []*Packet{}
 	for _, packet := range f.pcapInfo.Gopackets {
-		newPacket := b.modifyIPLayer(&packet)
-
+		newPacket := b.modifyIPLayer(&packet, f)
 		packetSize := len(packet.Data())
 		b.generatedPackets++
 		b.generatedBytes += int64(packetSize)
@@ -217,7 +263,7 @@ func (b *SyntheticPcapTraceBuilder) processPackets(f *Flow) {
 
 		if b.lastSecondPackets > b.maxPacketPerSecond || b.lastSecondBytes > b.maxBytesPerSecond {
 			b.flushPackets(packets)
-			packets = []gopacket.Packet{}
+			packets = []*Packet{}
 		}
 	}
 }
@@ -280,7 +326,15 @@ func NewSyntheticPcapTraceBuilder(GoalMbps int, GoalAvgPacketSize int, GoalFlowR
 }
 
 func main() {
+	debug := false
+	flag.BoolVar(&debug, "debug", false, "print debug messages")
+	flag.Parse()
+
 	logOutput, _ := os.Open(os.DevNull)
+	if debug {
+		logOutput = os.Stdout
+	}
+
 	log.SetOutput(logOutput)
 	b := NewSyntheticPcapTraceBuilder(10, 1000, 1000, 10000)
 	b.genLimitSeconds = 10
