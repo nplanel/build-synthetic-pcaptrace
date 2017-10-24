@@ -145,6 +145,7 @@ type SyntheticPcapTraceBuilder struct {
 	GoalAvgPacketSize            int
 	GoalFlowRampUpDownPerSecond  int
 	GoalFlowSteadyStatePerSecond int
+	GoalSteadyStateSeconds       int
 
 	maxPacketPerSecond int
 	maxBytesPerSecond  int
@@ -169,6 +170,7 @@ type SyntheticPcapTraceBuilder struct {
 	currentPacketTime time.Time
 	pcapDB            *PCAPDatabase
 	pcapOUT           *pcapgo.Writer
+	packets           []*Packet
 }
 
 func (b *SyntheticPcapTraceBuilder) updateMaxValues() {
@@ -177,14 +179,22 @@ func (b *SyntheticPcapTraceBuilder) updateMaxValues() {
 	b.maxBytesPerSecond = bytesPerSecond
 	b.maxFlowsPerSecond = b.GoalFlowRampUpDownPerSecond
 	b.maxFlows = b.GoalFlowSteadyStatePerSecond
+
+	log.Printf(
+		"maxPacketPerSecond %d\n"+"maxBytesPerSecond %d\n"+"maxFlowsPerSecond %d\n"+"maxFlows %d\n",
+		b.maxPacketPerSecond,
+		b.maxBytesPerSecond,
+		b.maxFlowsPerSecond,
+		b.maxFlows)
+
 }
 
-func (b *SyntheticPcapTraceBuilder) flushPackets(packets []*Packet) {
+func (b *SyntheticPcapTraceBuilder) flushPackets() {
 	flushAt := b.currentPacketTime
 
-	usec := 1000000.0 / len(packets)
-	log.Printf("flush %d packets, usec per packet %d flush at %v", len(packets), usec, flushAt)
-	for _, packet := range packets {
+	usec := 1000000.0 / len(b.packets)
+	//	log.Printf("flush %d packets, usec per packet %d flush at %v", len(packets), usec, flushAt)
+	for _, packet := range b.packets {
 		data := packet.data
 		ci := gopacket.CaptureInfo{
 			CaptureLength: len(data),
@@ -249,8 +259,8 @@ func (b *SyntheticPcapTraceBuilder) modifyIPLayer(packet *gopacket.Packet, f *Fl
 }
 
 func (b *SyntheticPcapTraceBuilder) processPackets(f *Flow) {
-	log.Printf("process %d packets", len(f.pcapInfo.Gopackets))
-	packets := []*Packet{}
+	//	log.Printf("process %d packets", len(f.pcapInfo.Gopackets))
+	b.packets = []*Packet{}
 	for _, packet := range f.pcapInfo.Gopackets {
 		newPacket := b.modifyIPLayer(&packet, f)
 		packetSize := len(packet.Data())
@@ -259,14 +269,43 @@ func (b *SyntheticPcapTraceBuilder) processPackets(f *Flow) {
 		b.lastSecondPackets++
 		b.lastSecondBytes += packetSize
 
-		packets = append(packets, newPacket)
+		b.packets = append(b.packets, newPacket)
 
 		if b.lastSecondPackets > b.maxPacketPerSecond || b.lastSecondBytes > b.maxBytesPerSecond {
-			b.flushPackets(packets)
-			packets = []*Packet{}
+			b.flushPackets()
+			b.packets = []*Packet{}
 		}
 	}
 }
+
+func removeFlowTable(ft *map[int64]*Flow, n int) int {
+	flows := 0
+	i := 0
+	for k, f := range *ft {
+		if i == n {
+			flows += f.pcapInfo.Flows
+			delete(*ft, k)
+		}
+		i++
+	}
+	return flows
+}
+
+func lenFlowTable(ft *map[int64]*Flow) int {
+	i := 0
+	for _, f := range *ft {
+		i += f.pcapInfo.Flows
+	}
+	return i
+}
+
+type buildState int
+
+const (
+	RAMPUP buildState = iota
+	STEADY
+	RAMPDOWN
+)
 
 func (b *SyntheticPcapTraceBuilder) Generate(pcapDatabaseDir string, pcapOut string) {
 	b.pcapDB = NewPCAPDatabase(pcapDatabaseDir)
@@ -279,21 +318,44 @@ func (b *SyntheticPcapTraceBuilder) Generate(pcapDatabaseDir string, pcapOut str
 	b.pcapOUT = pcapgo.NewWriter(f)
 	b.pcapOUT.WriteFileHeader(65536, layers.LinkTypeEthernet)
 
+	flowTable := make(map[int64]*Flow)
+	state := RAMPUP
+	var startSteadyAt time.Time
 	run := true
 	for run {
-		lastSecondFlowTable := make(map[int64]*Flow)
-		// Generate flows for one second of traffic, up to max_flow
-		if b.lastSecondFlows < b.maxFlowsPerSecond && len(lastSecondFlowTable) < b.maxFlows {
-			for b.lastSecondFlows < b.maxFlowsPerSecond {
-				pinfo := b.pcapDB.GetNext()
-				f := b.newFlow(pinfo)
-				lastSecondFlowTable[f.ID] = f
-				b.lastSecondFlows += pinfo.Flows
+
+		if state == RAMPUP {
+			// Generate flows for one second of traffic, up to max_flow
+			if b.lastSecondFlows < b.maxFlowsPerSecond {
+				for b.lastSecondFlows < b.maxFlowsPerSecond {
+					pinfo := b.pcapDB.GetNext()
+					f := b.newFlow(pinfo)
+					flowTable[f.ID] = f
+					b.lastSecondFlows += pinfo.Flows
+				}
 			}
 		}
-		log.Printf("generated %d flows %v", b.lastSecondFlows, b.currentPacketTime.Sub(b.startTime))
+		if state == RAMPUP && lenFlowTable(&flowTable) >= b.maxFlows {
+			state = STEADY
+			startSteadyAt = b.currentPacketTime
+		}
+		if state == STEADY && b.currentPacketTime.Sub(startSteadyAt) >= (time.Duration(b.GoalSteadyStateSeconds)*time.Second) {
+			state = RAMPDOWN
+		}
+		if state == RAMPDOWN {
+			flowsRemoved := b.GoalFlowRampUpDownPerSecond
+			for flowsRemoved > 0 && lenFlowTable(&flowTable) > 0 {
+				flowsRemoved -= removeFlowTable(&flowTable, b.rand.Intn(len(flowTable)))
+			}
+			if lenFlowTable(&flowTable) == 0 {
+				b.flushPackets()
+				run = false
+				break
+			}
+		}
+		log.Printf("state %d generated %d flows %v : flowtable %d", state, b.lastSecondFlows, b.currentPacketTime.Sub(b.startTime), lenFlowTable(&flowTable))
 
-		for _, f := range lastSecondFlowTable {
+		for _, f := range flowTable {
 			b.processPackets(f)
 			if b.genLimitPackets > 0 && b.generatedPackets >= b.genLimitPackets {
 				run = false
@@ -311,12 +373,13 @@ func (b *SyntheticPcapTraceBuilder) Generate(pcapDatabaseDir string, pcapOut str
 	}
 }
 
-func NewSyntheticPcapTraceBuilder(GoalMbps int, GoalAvgPacketSize int, GoalFlowRampUpDownPerSecond int, GoalFlowSteadyStatePerSecond int) *SyntheticPcapTraceBuilder {
+func NewSyntheticPcapTraceBuilder(GoalMbps int, GoalAvgPacketSize int, GoalFlowRampUpDownPerSecond int, GoalFlowSteadyStatePerSecond int, GoalSteadyStateSeconds int) *SyntheticPcapTraceBuilder {
 	b := &SyntheticPcapTraceBuilder{
 		GoalMbps:                     GoalMbps,
 		GoalAvgPacketSize:            GoalAvgPacketSize,
 		GoalFlowRampUpDownPerSecond:  GoalFlowRampUpDownPerSecond,
 		GoalFlowSteadyStatePerSecond: GoalFlowSteadyStatePerSecond,
+		GoalSteadyStateSeconds:       GoalSteadyStateSeconds,
 	}
 	b.updateMaxValues()
 	b.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -334,9 +397,9 @@ func main() {
 	if debug {
 		logOutput = os.Stdout
 	}
-
 	log.SetOutput(logOutput)
-	b := NewSyntheticPcapTraceBuilder(10, 1000, 1000, 10000)
-	b.genLimitSeconds = 10
+
+	b := NewSyntheticPcapTraceBuilder(100, 1000, 1000, 10000, 120)
+	b.genLimitSeconds = 1200
 	b.Generate("template", "out.pcap")
 }
